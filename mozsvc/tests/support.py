@@ -36,6 +36,8 @@
 """ Test helpers
 """
 from collections import defaultdict
+import json
+import time
 
 
 def _int2status(status):
@@ -51,22 +53,14 @@ def _int2status(status):
 
 class ClientTesterMiddleware(object):
     """Middleware that let a client drive failures for testing purposes.
-
-    The client sends POST requests with the desired status code, e.g.:
-
-        /__testing__/503
-        /__testing__/400
-
-    Everytime such a call is made, it's appended to an list. The next
-    call by the same client IP will result in a replay of the list,
-    until it's empty.
-
-    Optionally, the body may contain the body to send back.
     """
-    def __init__(self, app, path='/__testing__'):
+    def __init__(self, app, record_path='/__testing__',
+                 filter_path='/__filter__'):
         self.app = app
-        self.path = path
+        self.record_path = record_path
+        self.filter_path = filter_path
         self.replays = defaultdict(list)
+        self.filters = defaultdict(dict)
 
     def _get_client_ip(self, environ):
         if 'HTTP_X_FORWARDED_FOR' in environ:
@@ -77,33 +71,119 @@ class ClientTesterMiddleware(object):
 
         return None
 
-    def _resp(self, sr, status, body='', ctype='text/plain'):
-        headers = [('Content-Type', ctype)]
-        sr(status, headers)
+    def _resp(self, sr, status='200 OK', body='', headers=None):
+        if headers is None:
+            headers = {}
+        if 'Content-Type' not in headers:
+            headers['Content-Type'] = 'text/plain'
+        sr(status, [(key, value.encode('utf8'))
+                    for key, value in headers.items()])
         return [body]
 
     def __call__(self, environ, start_response):
         path = environ['PATH_INFO']
-        client_ip = self._get_client_ip(environ)
-        replays = self.replays[client_ip]
+        environ['_ip'] = ip = self._get_client_ip(environ)
+        environ['_replays'] = replays = self.replays[ip]
+        environ['_filters'] = filters = self.filters[ip]
 
-        if not path.startswith(self.path):
-            # do we have something to replay ?
-            if len(replays) > 0:
-                # yes
-                status, body = replays.pop()
-                status = _int2status(status)
-                return self._resp(start_response, status, body)
-            else:
-                # no, regular app
-                return self.app(environ, start_response)
+        # routing
+        if path.startswith(self.record_path):
+            return self._record(environ, start_response)
+        elif path.startswith(self.filter_path):
+            return self._filter(environ, start_response)
+
+
+        def sr(_filters):
+            def _sr(status, headers):
+                res = start_response(status, headers)
+                intst = int(status.split()[0])
+                if intst in _filters:
+                    time.sleep(_filters[intst])
+                elif '*' in _filters:
+                    time.sleep(_filters['*'])
+                return res
+            return _sr
+
+
+        # classical call, do we have something to replay ?
+        if len(replays) > 0:
+            # yes
+            replay = replays.pop()
+            status = _int2status(replay['status'])
+            body = replay.get('body', u'').encode('utf8')
+            headers = replay.get('headers')
+            delay = replay.get('delay', 0)
+
+            # repeat it, always
+            if replay.get('repeat') == -1:
+                replays.insert(0, replay)
+
+            res = self._resp(sr(filters), status, body, headers)
+            time.sleep(delay)
+            return res
+        else:
+            # no, regular app
+            return self.app(environ, sr(filters))
+
+    def _badmethod(self, method, allowed, start_response):
+        if method not in allowed:
+            return self._resp(start_response,
+                              '405 Method not ALlowed',
+                              {'Allow': ','.join(allowed)})
+        return None
+
+    def _record(self, environ, start_response):
+        # what's the method ?
+        method = environ['REQUEST_METHOD']
+        bad = self._badmethod(method, ('POST', 'DELETE'), start_response)
+        if bad is not None:
+            return bad
+
+        replays = environ['_replays']
+        if method == 'DELETE':
+            # wipe out
+            replays[:] = []
+            return self._resp(start_response)
 
         # that's something to add to the pile
         try:
-            status = int(path.split('/')[-1])
-        except TypeError:
+            resp = json.loads(environ['wsgi.input'].read())
+        except ValueError:
             return self._resp(start_response, '400 Bad Request')
 
-        body = environ['wsgi.input'].read()
-        replays.insert(0, (status, body))
-        return self._resp(start_response, '200 OK')
+        repeat = resp.get('repeat', 1)
+        if repeat == -1:
+            # will repeat indefinitely
+            replays.insert(0, resp)
+        else:
+            for i in range(repeat):
+                replays.insert(0, resp)
+
+        return self._resp(start_response)
+
+    def _filter(self, environ, start_response):
+        # what's the method ?
+        method = environ['REQUEST_METHOD']
+        bad = self._badmethod(method, ('POST', 'DELETE'), start_response)
+        if bad is not None:
+            return bad
+
+        filters = environ['_filters']
+        if method == 'DELETE':
+            # wipe out
+            filters.clear()
+            return self._resp(start_response)
+
+        # that's something to set
+        try:
+            new = json.loads(environ['wsgi.input'].read())
+        except ValueError:
+            return self._resp(start_response, '400 Bad Request')
+        filters.clear()
+
+        for status, delay in new.items():
+            if status != '*':
+                status = int(status)
+            filters[status] = delay
+
+        return self._resp(start_response)

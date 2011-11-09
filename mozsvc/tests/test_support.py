@@ -36,6 +36,8 @@
 """ Tests for mozsvc.tests.support
 """
 import unittest
+from json import dumps as _d
+import time
 
 from webtest import TestApp
 from webob.dec import wsgify
@@ -64,11 +66,81 @@ class TestSupport(unittest.TestCase):
         app.get('/bleh', status=200)
 
         # let's ask for a 503 and then a 400
-        app.post('/__testing__/503')
-        app.post('/__testing__/400')
+        app.post('/__testing__', params=_d({'status': 503}))
+        app.post('/__testing__', params=_d({'status': 400}))
 
         app.get('/buh', status=503)
         app.get('/buh', status=400)
 
         # back to normal
         app.get('/buh', status=200)
+
+        # let's ask for two 503s
+        app.post('/__testing__',
+                 params=_d({'status': 503, 'repeat': 2}))
+
+        app.get('/buh', status=503)
+        app.get('/buh', status=503)
+        app.get('/buh', status=200)
+
+        # some headers and body now
+        app.post('/__testing__',
+                params=_d({'status': 503, 'body': 'oy',
+                           'headers': {'foo': '1'}}))
+
+        res = app.get('/buh', status=503)
+        self.assertEqual(res.body, 'oy')
+        self.assertEqual(res.headers['foo'], '1')
+
+        # repeat stuff indefinitely
+        app.post('/__testing__',
+                params=_d({'status': 503, 'body': 'oy',
+                           'headers': {'foo': '1'},
+                           'repeat': -1}))
+
+        for i in range(20):
+            app.get('/buh', status=503)
+
+        # let's wipe out the pile
+        app.delete('/__testing__')
+        app.get('/buh', status=200)
+
+        # a bit of timing now
+        app.post('/__testing__',
+                params=_d({'status': 503, 'delay': .5}))
+        now = time.time()
+        app.get('/buh', status=503)
+        then = time.time()
+        self.assertTrue(then - now >= .5)
+
+
+    def test_filtering(self):
+        # we want to add .5 delays for *all* requests
+        delays = {'*': .5}
+
+        app = TestApp(ClientTesterMiddleware(SomeApp()))
+        app.post('/__filter__', params=_d(delays))
+
+        # let see if it worked
+        now = time.time()
+        app.get('/buh', status=200)
+        then = time.time()
+        self.assertTrue(then - now >= .5)
+
+        # we want to add .5 delays for *503* requests only
+        delays = {503: .5}
+
+        app = TestApp(ClientTesterMiddleware(SomeApp()))
+        app.post('/__filter__', params=_d(delays))
+
+        # let see if it worked
+        now = time.time()
+        app.get('/buh', status=200)
+        then = time.time()
+        self.assertTrue(then - now < .5)
+
+        app.post('/__testing__', params=_d({'status': 503}))
+        now = time.time()
+        app.get('/buh', status=503)
+        then = time.time()
+        self.assertTrue(then - now >= .5)
